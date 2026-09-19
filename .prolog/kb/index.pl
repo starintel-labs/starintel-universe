@@ -1,5 +1,6 @@
-% Durable knowledge base — load with :- ['kb/index.pl'].
-:- [kb/universe-architecture].
-:- [kb/starintel-server-contracts].
-:- [kb/nix-integration].
-:- [kb/tooling].
+% Durable knowledge base — load with :- ['.prolog/kb/index.pl'].
+% (Relative consults resolve from THIS directory.)
+:- [universe-architecture].
+:- [starintel-server-contracts].
+:- [nix-integration].
+:- [tooling].
