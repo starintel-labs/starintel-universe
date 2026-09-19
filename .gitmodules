@@ -1,0 +1,30 @@
+[submodule "components/starintel-server"]
+	path = components/starintel-server
+	url = https://git.starintel.actor/nsaspy/starintel-server.git
+[submodule "components/quasar"]
+	path = components/quasar
+	url = https://git.starintel.actor/nsaspy/quasar.git
+[submodule "components/quasar-ui"]
+	path = components/quasar-ui
+	url = https://git.starintel.actor/nsaspy/quasar-ui.git
+[submodule "components/star-lang"]
+	path = components/star-lang
+	url = https://git.starintel.actor/nsaspy/star-lang.git
+[submodule "components/star-kb"]
+	path = components/star-kb
+	url = https://git.starintel.actor/nsaspy/star-kb.git
+[submodule "components/star-cl"]
+	path = components/star-cl
+	url = https://git.starintel.actor/nsaspy/star-cl.git
+[submodule "components/prolog-rlm"]
+	path = components/prolog-rlm
+	url = https://git.starintel.actor/nsaspy/prolog-rlm.git
+[submodule "components/zara"]
+	path = components/zara
+	url = https://git.starintel.actor/nsaspy/zara.git
+[submodule "components/zara-plugins"]
+	path = components/zara-plugins
+	url = https://git.starintel.actor/nsaspy/zara-plugins.git
+[submodule "components/dotfiles"]
+	path = components/dotfiles
+	url = https://git.starintel.actor/nsaspy/dotfiles.git
