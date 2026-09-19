@@ -285,6 +285,8 @@ class ActorMatrix(unittest.TestCase):
     # -- config updates ------------------------------------------------------
     def test_60_config_reload(self):
         cfg = os.environ.get("STARINTEL_TEST_ACTOR_CONFIG")
+        with open(cfg, "w") as f:
+            f.write("mode=default\n")
         t1 = f"{self.prefix}-cfg1"
         submit_target("config-reload-actor", t1)
         d1 = wait_for(lambda: actor_docs("config-reload-actor", t1) or None,
