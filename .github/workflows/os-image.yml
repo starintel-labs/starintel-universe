@@ -1,0 +1,56 @@
+name: os-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  iso:
+    name: StarIntel OS ISO (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: starintel
+          skipPush: true
+      - name: build ISO
+        run: nix build .#starintel-iso --out-link /tmp/starintel-iso
+      - name: collect artifacts + checksums
+        run: |
+          mkdir -p dist
+          ISO=$(find /tmp/starintel-iso/iso -name '*.iso' | head -1)
+          cp "$ISO" "dist/$(basename "$ISO")"
+          ( cd dist && sha256sum * > SHA256SUMS )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starintel-os-iso
+          path: dist/
+      - name: ISO boot smoke (QEMU)
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+          ISO=$(find dist -name '*.iso' | head -1)
+          timeout 300 qemu-system-x86_64 -machine accel=tcg -m 4096 \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -cdrom "$ISO" -nographic -no-reboot \
+            -device virtio-net-pci,netdev=n0 -netdev user,id=n0 &
+          QPID=$!
+          # The live session autologins to a desktop; we at least assert
+          # the bootloader reaches userspace by waiting for the process to
+          # stay alive past kernel+initrd load.
+          sleep 180
+          if kill -0 $QPID 2>/dev/null; then
+            echo "ISO still running after 180s: boot OK"
+            kill $QPID || true
+          else
+            echo "ISO process exited early"; exit 1
+          fi

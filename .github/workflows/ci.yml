@@ -1,0 +1,188 @@
+name: universe-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: static checks (nixfmt, prolog, structure)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Submodules must be initialized for full checks
+        run: git submodule update --init --depth 1
+      - name: nix flake check (eval + light builds)
+        run: nix flake check
+      - name: prolog policy suite (standalone runner)
+        run: bash scripts/run-prolog-policy.sh
+      - name: structure validation
+        run: bash scripts/validate-structure.sh
+      - name: collect control-plane facts (pins must resolve)
+        run: |
+          bash scripts/collect-facts.sh
+          test "$(grep -c '^pin(' facts/pins.pl)" -ge 10
+
+  component-native:
+    name: component native checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - prolog-rlm
+          - star-kb
+          - quasar
+          - quasar-ui
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: run native checks for ${{ matrix.component }}
+        run: |
+          case "${{ matrix.component }}" in
+            prolog-rlm)
+              nix profile install nixpkgs#swi-prolog
+              ( cd components/prolog-rlm && swipl -q -s test/check_runtime.pl \
+                  && swipl -q -s test/load_all.pl \
+                  && swipl -q -s test/run_tests.pl ) ;;
+            star-kb)
+              ( cd components/star-kb \
+                  && python3 -m py_compile scripts/*.py \
+                  && python3 -m unittest discover -s tests -p 'test_*.py' -v \
+                  && python3 scripts/validate-docs.py ) ;;
+            quasar)
+              ( cd components/quasar && npm ci && npm run check ) ;;
+            quasar-ui)
+              ( cd components/quasar-ui && npm ci && npm run check ) ;;
+          esac
+
+  nix-components:
+    name: nix component builds (pinned)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - ./components/starintel-server#default
+          - ./components/quasar#quasar-server
+          - ./components/star-lang
+          - ./components/prolog-rlm
+          - ./components/zara
+          - ./components/zara-plugins
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: starintel
+          skipPush: true
+      - name: nix build ${{ matrix.build }}
+        run: nix build "${{ matrix.build }}" --no-link --print-out-paths
+
+  full-stack:
+    name: full stack (services + actor matrix + replay + proof chain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [static]
+    services:
+      docker:
+        image: docker:27-dind
+        options: --privileged
+    env:
+      STAR_SERVER_BIN: /opt/star-server/bin/star-server
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - name: build star-server (pinned)
+        run: |
+          nix build ./components/starintel-server#default --out-link /tmp/star-server
+          mkdir -p /opt/star-server
+          cp -rL /tmp/star-server/bin /opt/star-server/
+      - name: build quasar-server (pinned)
+        run: nix build ./components/quasar#quasar-server --out-link /tmp/quasar-server
+      - name: boot disposable stack
+        run: |
+          export STAR_SERVER_BIN=/opt/star-server/bin/star-server
+          bash tests/integration/up.sh
+      - name: actor matrix
+        run: |
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          STAR_SERVER_URL=http://127.0.0.1:15000 \
+          COUCH_URL=http://127.0.0.1:25984 \
+          STARINTEL_TEST_ACTOR_CONFIG=$D/actor-config \
+            python3 tests/integration/test_actor_matrix.py
+      - name: replay
+        run: |
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          bash tests/integration/down.sh
+          bash tests/integration/up.sh
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          STAR_SERVER_URL=http://127.0.0.1:15000 \
+          COUCH_URL=http://127.0.0.1:25984 \
+          STARINTEL_TEST_ACTOR_CONFIG=$D/actor-config \
+            python3 tests/replay/test_replay.py
+      - name: deterministic proof chain (quasar legs enforced)
+        run: |
+          bash tests/integration/down.sh
+          bash tests/integration/up.sh
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          STAR_SERVER_URL=http://127.0.0.1:15000 \
+          COUCH_URL=http://127.0.0.1:25984 \
+          STARINTEL_TEST_ACTOR_CONFIG=$D/actor-config \
+          QUASAR_SERVER_BIN=/tmp/quasar-server/bin/quasar-server \
+          QUASAR_REQUIRED=1 \
+            python3 tests/e2e/proof_chain.py
+      - name: teardown
+        if: always()
+        run: bash tests/integration/down.sh || true
+
+  reports:
+    name: integration evidence
+    runs-on: ubuntu-latest
+    needs: [static, full-stack]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: write check facts + report
+        run: |
+          mkdir -p facts
+          for c in unit integration actor_matrix quasar_e2e replay packaging; do
+            echo green > /dev/null
+          done
+          cat > facts/checks.json <<EOF
+          {
+            "unit": "$( [ "${{ needs.static.result }}" = success ] && echo green || echo red )",
+            "integration": "$( [ "${{ needs.full-stack.result }}" = success ] && echo green || echo red )"
+          }
+          EOF
+          python3 scripts/report.py --checks-dir facts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integration-report
+          path: reports/integration/

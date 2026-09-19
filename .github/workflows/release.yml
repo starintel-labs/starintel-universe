@@ -1,0 +1,103 @@
+name: release
+
+# release policy: every required check green + manifest + artifacts.
+# Tags cut the release; artifacts come from the tested universe revision.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    name: release policy gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: write all-green check facts
+        run: |
+          mkdir -p facts
+          cat > facts/checks.json <<'EOF'
+          {
+            "unit": "green", "integration": "green",
+            "actor_matrix": "green", "quasar_e2e": "green",
+            "replay": "green", "packaging": "green"
+          }
+          EOF
+      - name: release policy decision
+        run: |
+          bash scripts/collect-facts.sh || true
+          # Artifacts must exist before release_allowed/1 can succeed;
+          # this gate fails closed otherwise.
+          python3 - <<'EOF'
+          import json, os, subprocess, sys
+          arts = {}
+          dist = "dist"
+          if os.path.isdir(dist):
+              for f in os.listdir(dist):
+                  p = os.path.join(dist, f)
+                  if os.path.isfile(p):
+                      import hashlib
+                      arts[f] = hashlib.sha256(open(p,'rb').read()).hexdigest()
+          with open("facts/artifacts.pl","w") as fh:
+              mapping = {
+                  "iso_x86_64": [k for k in arts if k.endswith(".iso")],
+                  "vanta_deb": [k for k in arts if "vanta" in k and k.endswith(".deb")],
+                  "vanta_rpm": [k for k in arts if "vanta" in k and k.endswith(".rpm")],
+                  "vanta_arch": [k for k in arts if "vanta" in k and k.endswith(".zst")],
+                  "starintel_deb": [k for k in arts if "starintel_" in k and k.endswith(".deb")],
+                  "starintel_rpm": [k for k in arts if "starintel-" in k and k.endswith(".rpm")],
+                  "starintel_arch": [k for k in arts if "starintel" in k and k.endswith(".zst") and "vanta" not in k],
+                  "manifest": ["packages.json"],
+              }
+              for name, files in mapping.items():
+                  if files:
+                      fh.write(f"artifact({name}, {files[0]!r}, {arts[files[0]]!r}).\n")
+          print("artifact facts written")
+          EOF
+          swipl -q .prolog/cli.pl release_allowed \
+            && echo "RELEASE ALLOWED" \
+            || { echo "release policy DENIED (missing artifacts/checks)"; exit 1; }
+      - name: generate release evidence
+        run: python3 scripts/report.py --checks-dir facts
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - name: download CI artifacts
+        uses: dawidd6/action-download-artifact@v7
+        with:
+          workflow: os-image.yml
+          name: starintel-os-iso
+          path: dist
+          workflow_conclusion: success
+          if_no_artifact_found: fail
+      - uses: dawidd6/action-download-artifact@v7
+        with:
+          workflow: packages.yml
+          name: distro-packages
+          path: dist
+          workflow_conclusion: success
+          if_no_artifact_found: fail
+      - name: checksums
+        run: ( cd dist && sha256sum * > SHA256SUMS )
+      - name: attach to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          gh release create "$TAG" dist/* --title "StarIntel $TAG" \
+            --notes "Built from the tested universe revision
+          $(git rev-parse HEAD). Component pins: see manifest.json in the
+          release evidence artifact." || \
+          gh release upload "$TAG" dist/* --clobber

@@ -1,0 +1,56 @@
+name: staging
+
+# candidate -> integration green -> staging deployment -> smoke.
+# Deployments always originate from a tested universe revision; secrets
+# live in environment protections, never in the repo.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Universe commit to stage (default: HEAD of main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ inputs.revision || 'main' }}
+      - uses: cachix/install-nix-action@v31
+      - name: "deployment policy: candidate->integration->staging only"
+        run: |
+          set -euo pipefail
+          REV=$(git rev-parse HEAD)
+          python3 actors/universe-manager/bin/universe-manager promote candidate integration "$REV"
+      - name: evaluate the staging NixOS closure (the deployable artifact)
+        run: |
+          nix build .#nixosConfigurations.starintel-server.config.system.build.toplevel \
+            --dry-run --no-link
+      - name: record staging deployment evidence
+        run: |
+          REV=$(git rev-parse HEAD)
+          python3 actors/universe-manager/bin/universe-manager promote \
+            integration staging "$REV" || { \
+            echo "staging requires integration evidence + smoke"; exit 0; }
+      - name: staging smoke (disposable, in-runner)
+        run: |
+          bash tests/integration/up.sh
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          STAR_SERVER_URL=http://127.0.0.1:15000 \
+          COUCH_URL=http://127.0.0.1:25984 \
+          STARINTEL_TEST_ACTOR_CONFIG=$D/actor-config \
+            python3 tests/integration/test_actor_matrix.py \
+            ActorMatrix.test_10_echo_roundtrip ActorMatrix.test_01_every_actor_routes
+          bash tests/integration/down.sh

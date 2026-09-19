@@ -1,0 +1,45 @@
+name: actor-e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: deterministic actor matrix + a2a
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      docker:
+        image: docker:27-dind
+        options: --privileged
+    env:
+      STAR_SERVER_BIN: /opt/star-server/bin/star-server
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - name: build pinned star-server
+        run: |
+          nix build ./components/starintel-server#default --out-link /tmp/star-server
+          mkdir -p /opt/star-server && cp -rL /tmp/star-server/bin /opt/star-server/
+      - name: stack up
+        run: bash tests/integration/up.sh
+      - name: matrix
+        run: |
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          STAR_SERVER_URL=http://127.0.0.1:15000 \
+          COUCH_URL=http://127.0.0.1:25984 \
+          STARINTEL_TEST_ACTOR_CONFIG=$D/actor-config \
+            python3 tests/integration/test_actor_matrix.py
+      - name: universe-manager actor tests
+        run: python3 tests/actors/test_universe_manager.py -v
+      - name: teardown
+        if: always()
+        run: bash tests/integration/down.sh || true

@@ -1,0 +1,77 @@
+name: quasar-e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: upstream quasar e2e (Playwright, real stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: quasar full stack e2e
+        working-directory: components/quasar
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:e2e -- --reporter=github,html
+      - name: quasar-ui native e2e
+        working-directory: components/quasar-ui
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: quasar-e2e-artifacts
+          path: |
+            components/quasar/frontend/playwright-report
+            components/quasar-ui/playwright-report
+          if-nothing-found: ignore
+
+  universe-proof:
+    name: universe proof chain (quasar legs enforced)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      docker:
+        image: docker:27-dind
+        options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - name: build pinned services
+        run: |
+          nix build ./components/starintel-server#default --out-link /tmp/star-server
+          nix build ./components/quasar#quasar-server --out-link /tmp/quasar-server
+          mkdir -p /opt/star-server && cp -rL /tmp/star-server/bin /opt/star-server/
+      - name: run deterministic proof chain
+        env:
+          STAR_SERVER_BIN: /opt/star-server/bin/star-server
+          QUASAR_SERVER_BIN: /tmp/quasar-server/bin/quasar-server
+          QUASAR_REQUIRED: "1"
+        run: |
+          bash tests/integration/up.sh
+          D=$(ls -dt /tmp/starintel-universe-test.* | head -1)
+          STAR_SERVER_URL=http://127.0.0.1:15000 \
+          COUCH_URL=http://127.0.0.1:25984 \
+          STARINTEL_TEST_ACTOR_CONFIG=$D/actor-config \
+            python3 tests/e2e/proof_chain.py
+      - name: teardown
+        if: always()
+        run: bash tests/integration/down.sh || true

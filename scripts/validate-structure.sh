@@ -16,7 +16,7 @@ mapfile -t gm_paths < <(grep '^\s*path = ' .gitmodules | sed 's/.*= //')
 if [ -e components/zara/.git ]; then
   git submodule status >/dev/null || fail "submodule status failed"
   for p in "${gm_paths[@]}"; do
-    [ -d "$p/.git" ] || fail "submodule not initialized: $p"
+    [ -e "$p/.git" ] || fail "submodule not initialized: $p"
   done
 else
   echo "note: sandboxed copy without submodule contents; skipping init checks"
