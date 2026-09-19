@@ -1,0 +1,109 @@
+#+TITLE: StarIntel Universe
+#+AUTHOR: StarIntel Labs
+
+The canonical integration of the StarIntel system. A commit on =main=
+means: *these exact revisions of every included component were built and
+tested together successfully.*
+
+* What is in the box
+
+- 10 pinned component submodules (starintel-server, quasar, quasar-ui,
+  star-lang, star-kb, star-cl, prolog-rlm, zara, zara-plugins, dotfiles)
+- a [[file:.prolog/][SWI-Prolog control plane]] that owns update/merge/release/deployment
+  policy — no LLM decides dependency updates, merges, releases, or
+  deployments
+- a [[file:flake.nix][Nix flake]] composing every component at its pinned revision:
+  packages, NixOS modules, profiles, and the =StarIntel OS= installer ISO
+  (=nix build .#starintel-iso=)
+- =VANTA= — the StarIntel agent distribution ([[file:distro/vanta/][distro/vanta]]): upstream
+  =zara= wrapped behind =vanta= names with an XDG-only bridge
+  (=zarathushtra → vanta= symlinks live inside the XDG trees, never new
+  =$HOME= dot-dirs)
+- deterministic full-stack tests: actor matrix (15 scenarios against real
+  CouchDB/RabbitMQ/Valkey/star-server), event replay proof, and the
+  canonical end-to-end chain
+  =Quasar → VANTA → Prolog-RLM → StarIntel → Actor → STAR-KB → Quasar=
+  with no LLM anywhere in the loop
+- distro packages (deb / rpm / arch) built from the same pinned inputs
+  with containerized install tests
+- the =universe-manager= actor ([[file:actors/universe-manager/][actors/universe-manager]]): a non-LLM
+  actor that proposes submodule updates, consults the Prolog policy, and
+  gates merges — it never bypasses branch protection
+
+* Quick start
+
+#+begin_src sh
+git clone --recursive https://git.starintel.actor/nsaspy/starintel-universe.git
+cd starintel-universe
+nix flake check          # eval + light checks (policy suite runs here)
+nix build .#starintel-iso # bootable StarIntel OS (x86_64)
+#+end_src
+
+Run the full-stack proof locally (needs Docker + nix):
+
+#+begin_src sh
+nix build ./components/starintel-server#default --out-link /tmp/star-server
+export STAR_SERVER_BIN=/tmp/star-server/bin/star-server
+bash tests/integration/up.sh      # couch + rabbit + valkey + star-server
+python3 tests/integration/test_actor_matrix.py
+python3 tests/replay/test_replay.py
+nix build ./components/quasar#quasar-server --out-link /tmp/quasar-server
+QUASAR_SERVER_BIN=/tmp/quasar-server/bin/quasar-server \
+QUASAR_REQUIRED=1 python3 tests/e2e/proof_chain.py
+bash tests/integration/down.sh
+#+end_src
+
+* Layout
+
+| path              | role                                                        |
+|-------------------+-------------------------------------------------------------|
+| =.prolog/=          | control plane: components, dependencies, update/merge/release/deployment policies + CLI |
+| =components/=       | pinned submodules (exact revisions)                         |
+| =nix/=              | flake support: modules, profiles, ISO, in-universe packages |
+| =distro/vanta/=     | VANTA distribution wrapper, branding, defaults, units       |
+| =actors/universe-manager/= | the deterministic update/gate actor                  |
+| =tests/=            | unit, contracts, integration, actors, a2a, quasar, vanta, replay, packaging, e2e |
+| =packaging/=        | deb / rpm / arch builders + install tests                   |
+| =deployments/=      | local / staging / production deployment runbooks            |
+| =reports/integration/= | per-revision machine+human evidence (generated)          |
+| =.github/workflows/= | ci, submodule-update, actor-e2e, quasar-e2e, os-image, packages, staging, release |
+
+* Policy, not prose
+
+The shell/CI gathers facts (=facts/*.pl= via =scripts/collect-facts.sh=);
+Prolog decides:
+
+#+begin_src prolog
+?- merge_allowed([c(quasar, 'a0…', 'b0…')]).
+?- release_allowed(universe).
+?- deployment_allowed(staging, release).
+#+end_src
+
+CLI bridge: =swipl -q .prolog/cli.pl <command>= (exit 0 = yes, 1 = no,
+2 = error). Full suite: =bash scripts/run-prolog-policy.sh= (30 tests).
+
+* VANTA and Zara
+
+VANTA is the StarIntel distribution identity of upstream
+=[[https://git.starintel.actor/nsaspy/zara][nsaspy/zara]]=. Upstream is never renamed; the universe ships wrappers
+(=vanta=, =vanta-server=, =vanta-desktop=, =vanta-wake=, =vanta-dictate=),
+offline-first defaults (local =ollama= provider; no credentials needed),
+desktop entries, and the XDG compatibility bridge. Wake listening is
+*never* enabled by default.
+
+* Security
+
+- No secrets in Nix derivations, Prolog facts, logs, artifacts, or reports.
+- Services use systemd hardening; secrets arrive via
+  =EnvironmentFile=/=secretsFile= references outside the store.
+- The update actor holds no repository-administration credentials and
+  never merges; branch protection and green CI govern merges.
+- Private components (e.g. =starintel-pro-actors=) are NOT submodules:
+  see =scripts/add-private-overlay.sh= — private content never enters
+  public artifacts.
+
+* License
+
+Universe integration code and the VANTA distribution wrapper are
+distributed under the licenses of their sources; component licenses
+govern their submodules (see each =components/*/LICENSE=).

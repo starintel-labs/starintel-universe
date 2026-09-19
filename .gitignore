@@ -14,6 +14,7 @@ result-*
 /.prolog/runs/
 /.prolog/facts.kb
 /.prolog/result.json
+/.prolog/verify.pl
 /.prolog/session/
 *.pce
 

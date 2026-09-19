@@ -6,5 +6,5 @@ Comment=VANTA terminal session (no provider required)
 Exec=@BIN@/vanta
 Icon=vanta
 Terminal=true
-Categories=Utility;System;ConsoleOnly;
+Categories=ConsoleOnly;
 Keywords=assistant;agent;starintel;

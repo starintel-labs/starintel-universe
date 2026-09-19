@@ -1,0 +1,30 @@
+# Local deployment
+
+The developer-machine deployment: everything on localhost, disposable.
+
+## Services
+
+#+begin_src sh
+bash tests/integration/up.sh     # CouchDB :25984, RabbitMQ :25672,
+                                 # Valkey :26379, star-server :15000
+bash tests/integration/down.sh
+#+end_src
+
+## NixOS VM (desktop profile)
+
+#+begin_src sh
+nix build .#nixosConfigurations.starintel-desktop.config.system.build.vm
+./result/bin/run-starintel-desktop-vm
+#+end_src
+
+## Environment contract
+
+| service       | address          | credentials (throwaway)  |
+|---------------+------------------+--------------------------|
+| star-server   | 127.0.0.1:15000  | auth disabled (dev bypass) |
+| CouchDB       | 127.0.0.1:25984  | admin / starintel-test   |
+| RabbitMQ      | 127.0.0.1:25672  | guest / guest            |
+| Valkey        | 127.0.0.1:26379  | none                     |
+
+All test ports are deliberately off the service defaults so a machine
+running real services is never disturbed.

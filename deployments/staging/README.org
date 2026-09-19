@@ -1,0 +1,29 @@
+# Staging deployment
+
+Stage transitions are owned by the Prolog control plane
+(=deployment_policy.pl=): =candidate → integration → staging=; stage
+skipping is denied. The =staging.yml= workflow is the mechanical
+executor; it never deploys untested revisions.
+
+## Flow
+
+1. =candidate= — a universe revision exists on a branch.
+2. =integration= — universe CI green on that revision.
+   #+begin_src sh
+   python3 actors/universe-manager/bin/universe-manager promote \
+     candidate integration <sha>
+   #+end_src
+3. =staging= — deploy the revision:
+
+   #+begin_src sh
+   nix build .#nixosConfigurations.starintel-server.config.system.build.toplevel
+   # deploy the closure to the staging host (out of band; secrets via the
+   # staging environment, never this repo)
+   python3 actors/universe-manager/bin/universe-manager promote \
+     integration staging <sha>   # requires smoke evidence
+   #+end_src
+
+## Smoke
+
+Staging must pass the actor-matrix routing/echo slice before the
+promotion is admissible (the workflow runs it automatically).

@@ -176,7 +176,7 @@
                 cp -r ${self} work -r
                 chmod -R u+w work
                 cd work
-                swipl -q -g "consult('.prolog/universe'), consult('.prolog/verify'), run_tests, halt(0)" -t "halt(2)"
+                swipl -q -g "consult('.prolog/universe'), consult('.prolog/policy_suite'), run_tests, halt(0)" -t "halt(2)"
                 touch $out
               '';
 

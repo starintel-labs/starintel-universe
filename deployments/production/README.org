@@ -1,0 +1,15 @@
+# Production deployment
+
+Production releases are cut from *green universe revisions only*:
+
+1. universe CI green (unit, integration, actor matrix, quasar e2e,
+   replay, packaging)
+2. staging deployment green with smoke evidence
+3. =release_allowed(universe)= succeeds — all artifacts recorded with
+   digests + manifest completeness
+4. release workflow attaches: StarIntel-OS ISO, vanta/starintel
+   deb/rpm/arch packages, SHA256SUMS, packages.json (component SHAs)
+
+No mutable "latest from component repo" deployment exists anywhere in
+this pipeline. Deployment credentials live in environment protections;
+PR code never runs with production secrets.

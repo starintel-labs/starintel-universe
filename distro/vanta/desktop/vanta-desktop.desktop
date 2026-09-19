@@ -6,6 +6,6 @@ Comment=VANTA — the StarIntel agent (desktop interface)
 Exec=@BIN@/vanta-desktop
 Icon=vanta
 Terminal=false
-Categories=Utility;System;Office;
+Categories=Utility;
 StartupNotify=true
 NoDisplay=false
