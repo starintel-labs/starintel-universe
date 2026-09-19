@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""universe-manager — deterministic StarIntel universe actor.
+
+Non-LLM actor that drives the Prolog control plane (.prolog/) for the
+component universe: inspect pins, discover upstream drift, propose
+admissible changesets, apply them to a branch, evaluate the merge gate
+against CI facts, and evaluate deployment promotion.
+
+Exit codes: 0 success, 1 policy-denied, 2 error.
+All swipl processes run with cwd = repository root; all git/nix ops run
+via subprocess with explicit argument lists (never shell=True).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+import policy  # noqa: E402
+
+STAGES = ("candidate", "integration", "staging", "release")
+FLAKE_INPUT_RE = re.compile(r"([A-Za-z0-9_-]+)\.url\s*=\s*" r'"git\+file:\./([^"]+)"')
+
+
+def emit(payload):
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def fail(message, code=2):
+    emit({"error": message})
+    print(f"universe-manager: {message}", file=sys.stderr)
+    return code
+
+
+def git(args, cwd, check=True):
+    proc = subprocess.run(
+        ["git"] + list(args),
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc
+
+
+def parse_gitmodules(root):
+    """Minimal git-config parser for .gitmodules (deterministic, no deps)."""
+    path = os.path.join(root, ".gitmodules")
+    if not os.path.isfile(path):
+        return []
+    entries = []
+    current = None
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            section = re.match(r'\s*\[submodule\s+"([^"]+)"\s*\]\s*$', line)
+            if section:
+                if current is not None:
+                    entries.append(current)
+                current = {"name": section.group(1)}
+                continue
+            if current is not None:
+                key = re.match(r"\s*(path|url|branch)\s*=\s*(.*?)\s*$", line)
+                if key:
+                    current[key.group(1)] = key.group(2)
+    if current is not None:
+        entries.append(current)
+    return [entry for entry in entries if entry.get("path")]
+
+
+def read_submodule_pins(root):
+    """git submodule status -> {path: sha} (index pins, prefix chars stripped)."""
+    proc = git(["submodule", "status"], cwd=root, check=False)
+    pins = {}
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        sha = fields[0].lstrip("+-U ").strip()
+        path = fields[1]
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            pins[path] = sha
+    return pins
+
+
+def read_head_facts(root):
+    """facts/heads.pl (if present) -> {component: sha}. Regex-parsed, so
+    files with unquoted digit-leading SHAs still read."""
+    path = os.path.join(root, "facts", "heads.pl")
+    heads = {}
+    if not os.path.isfile(path):
+        return heads
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            match = re.match(
+                r"upstream_head\(\s*'?([A-Za-z_][A-Za-z0-9_]*)'?\s*,\s*'"
+                r"?([0-9a-fA-F]{40})'?\s*\)",
+                line.strip(),
+            )
+            if match:
+                heads.setdefault(match.group(1), match.group(2).lower())
+    return heads
+
+
+def ls_remote_head(url, branch, cwd):
+    proc = subprocess.run(
+        ["git", "ls-remote", url, f"refs/heads/{branch}"],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    sha = proc.stdout.split()[0]
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def gather_universe(root):
+    """One deterministic snapshot: registry, submodule pins, upstream heads."""
+    path_to_components, component_branch = policy.parse_registry(root)
+    submodules = parse_gitmodules(root)
+    pins = read_submodule_pins(root)
+    head_facts = read_head_facts(root)
+
+    components = []
+    for entry in submodules:
+        path = entry["path"]
+        url = entry.get("url", "")
+        names = path_to_components.get(path, [])
+        pin = pins.get(path)
+        for name in names:
+            head = head_facts.get(name)
+            if head is None and url:
+                branch = component_branch.get(name, "main")
+                head = ls_remote_head(url, branch, cwd=root)
+            components.append(
+                {
+                    "component": name,
+                    "path": path,
+                    "url": url,
+                    "pin": pin,
+                    "head": head,
+                    "stale": None
+                    if (pin is None or head is None)
+                    else pin != head,
+                }
+            )
+    return {
+        "root": root,
+        "components": components,
+        "path_to_components": path_to_components,
+    }
+
+
+def stale_changes(snapshot):
+    changes = []
+    for entry in snapshot["components"]:
+        if entry["stale"]:
+            changes.append(
+                {
+                    "component": entry["component"],
+                    "path": entry["path"],
+                    "url": entry["url"],
+                    "from": entry["pin"],
+                    "to": entry["head"],
+                }
+            )
+    return changes
+
+
+# ----------------------------------------------------------------------
+
+
+def cmd_inspect(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    snapshot = gather_universe(root)
+    emit({"components": snapshot["components"]})
+    return 0
+
+
+def cmd_discover(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    snapshot = gather_universe(root)
+    emit(stale_changes(snapshot))
+    return 0
+
+
+def cmd_facts(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    facts_dir = os.path.join(root, "facts")
+    os.makedirs(facts_dir, exist_ok=True)
+    path_to_components, component_branch = policy.parse_registry(root)
+    submodules = parse_gitmodules(root)
+    pins = read_submodule_pins(root)
+
+    pin_lines = ["% machine-generated by universe-manager facts; no secrets"]
+    for entry in submodules:
+        path = entry["path"]
+        sha = pins.get(path)
+        if sha is None:
+            continue
+        branch_out = git(
+            ["branch", "--contains", sha], cwd=os.path.join(root, path), check=False
+        ).stdout
+        branch = "detached"
+        for line in branch_out.splitlines():
+            candidate = line.strip().lstrip("*").strip()
+            if candidate in ("main", "master"):
+                branch = candidate
+                break
+        for name in path_to_components.get(path, []):
+            pin_lines.append(
+                "pin({}, {}, {}).".format(
+                    policy.prolog_atom(name),
+                    policy.prolog_atom(sha),
+                    policy.prolog_atom(branch),
+                )
+            )
+    with open(os.path.join(facts_dir, "pins.pl"), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(pin_lines) + "\n")
+
+    head_lines = ["% machine-generated by universe-manager facts; no secrets"]
+    for entry in submodules:
+        path = entry["path"]
+        names = path_to_components.get(path, [])
+        if not names or not entry.get("url"):
+            continue
+        branch = component_branch.get(names[0], "main")
+        head = ls_remote_head(entry["url"], branch, cwd=root)
+        if head is None:
+            continue
+        for name in names:
+            head_lines.append(
+                "upstream_head({}, {}).".format(
+                    policy.prolog_atom(name), policy.prolog_atom(head)
+                )
+            )
+    with open(os.path.join(facts_dir, "heads.pl"), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(head_lines) + "\n")
+
+    head_sha = git(["rev-parse", "HEAD"], cwd=root).stdout.strip()
+    notes_path = os.path.join(facts_dir, "notes.pl")
+    keep = []
+    if os.path.isfile(notes_path):
+        with open(notes_path, encoding="utf-8") as handle:
+            for line in handle:
+                if "note(revalidates(" in line:
+                    keep.append(line.strip())
+    note_lines = [
+        "% machine-generated by universe-manager facts; no secrets",
+        "revision_note(universe, note(sha({}))).".format(
+            policy.prolog_atom(head_sha)
+        ),
+    ] + keep
+    with open(notes_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(note_lines) + "\n")
+    print(f"facts written to {facts_dir}", file=sys.stderr)
+    return 0
+
+
+def cmd_propose(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    snapshot = gather_universe(root)
+    known = {name for names in snapshot["path_to_components"].values() for name in names}
+    if args.components:
+        wanted = [name.strip() for name in args.components.split(",") if name.strip()]
+        unknown = [name for name in wanted if name not in known]
+        if unknown:
+            return fail(f"unknown component(s): {', '.join(unknown)}")
+    else:
+        wanted = None
+    if not args.all and wanted is None:
+        return fail("propose requires --components <a,b> or --all")
+
+    changes = [
+        change
+        for change in stale_changes(snapshot)
+        if wanted is None or change["component"] in wanted
+    ]
+
+    for change in changes:
+        rc, _ = policy.run_swipl(
+            ["candidate", change["component"], change["from"], change["to"]], cwd=root
+        )
+        if rc != 0:
+            single = [change]
+            _, out = policy.run_swipl(
+                ["merge_denial", policy.build_changeset(single)], cwd=root
+            )
+            emit(
+                {
+                    "policy": "denied",
+                    "denials": policy.parse_denials(out)
+                    or [f"candidate_rejected for {change['component']}"],
+                }
+            )
+            return 1
+
+    changed_names = {change["component"] for change in changes}
+    revalidates = []
+    for name in sorted(changed_names):
+        for dependent in policy.query_dependents(name, cwd=root):
+            if dependent not in changed_names:
+                revalidates.append(dependent)
+    if revalidates:
+        policy.append_fact_lines(
+            os.path.join(root, "facts", "notes.pl"),
+            [
+                "revision_note(universe, note(revalidates({}))).".format(
+                    policy.prolog_atom(dependent)
+                )
+                for dependent in revalidates
+            ],
+        )
+
+    digest = hashlib.sha1(
+        json.dumps(changes, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:8]
+    date = datetime.date.today().strftime("%Y%m%d")
+    branch = f"universe-update/{date}-{digest}"
+    emit({"branch": branch, "changes": changes, "policy": "admissible"})
+    return 0
+
+
+def cmd_apply(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    try:
+        with open(args.proposal, encoding="utf-8") as handle:
+            proposal = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return fail(f"cannot read proposal {args.proposal}: {exc}")
+    if proposal.get("policy") != "admissible":
+        return fail("proposal is not marked admissible; refusing to apply")
+    branch = proposal.get("branch", "")
+    changes = proposal.get("changes", [])
+    if not branch or not changes:
+        return fail("proposal missing branch or changes")
+
+    current_branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root).stdout.strip()
+    if current_branch == branch:
+        return fail(f"already on {branch}")
+    if git(["rev-parse", "--verify", branch], cwd=root, check=False).returncode == 0:
+        return fail(f"branch {branch} already exists")
+    git(["checkout", "-b", branch], cwd=root)
+
+    pins = read_submodule_pins(root)
+    for change in changes:
+        path, to_sha = change["path"], change["to"]
+        from_sha = pins.get(path)
+        if from_sha != change["from"]:
+            git(["checkout", "-"], cwd=root)
+            return fail(
+                f"worktree pin for {path} ({from_sha}) drifted from proposal "
+                f"({change['from']}); re-run propose"
+            )
+        comp_root = os.path.join(root, path)
+        fetch = git(["fetch", "origin", to_sha], cwd=comp_root, check=False)
+        if fetch.returncode != 0:
+            git(["fetch", "origin"], cwd=comp_root)
+        if (
+            git(["cat-file", "-e", f"{to_sha}^{{commit}}"], cwd=comp_root, check=False).returncode
+            != 0
+        ):
+            git(["checkout", "-"], cwd=root)
+            return fail(f"target revision {to_sha} not present for {path}")
+        git(["checkout", to_sha], cwd=comp_root)
+        git(["add", path], cwd=root)
+
+        url = change.get("url")
+        if url:
+            module_url = git(
+                ["config", "-f", ".gitmodules", "--get", f"submodule.{path}.url"],
+                cwd=root,
+                check=False,
+            ).stdout.strip()
+            if module_url and module_url != url:
+                git(
+                    ["config", "-f", ".gitmodules", f"submodule.{path}.url", url],
+                    cwd=root,
+                )
+                git(["submodule", "sync", path], cwd=root)
+                git(["remote", "set-url", "origin", url], cwd=comp_root)
+
+    update_nix_locks(root, changes)
+
+    proposals_dir = os.path.join(root, "proposals")
+    os.makedirs(proposals_dir, exist_ok=True)
+    proposal_path = os.path.join(proposals_dir, f"{branch.split('/')[-1]}.json")
+    with open(proposal_path, "w", encoding="utf-8") as handle:
+        json.dump(proposal, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    git(["add", proposal_path], cwd=root)
+
+    message_lines = [f"universe-manager: apply {branch}", ""]
+    for change in changes:
+        message_lines.append(
+            "{}: {} -> {}".format(
+                change["component"], change["from"][:12], change["to"][:12]
+            )
+        )
+    message_lines += ["", "policy: admissible (universe-manager 1.0.0)"]
+    git(["commit", "-m", "\n".join(message_lines)], cwd=root)
+    commit = git(["rev-parse", "HEAD"], cwd=root).stdout.strip()
+    emit({"branch": branch, "commit": commit})
+    return 0
+
+
+def update_nix_locks(root, changes):
+    """nix flake lock --update-input for changed component inputs."""
+    flake = os.path.join(root, "flake.nix")
+    if not os.path.isfile(flake):
+        return
+    with open(flake, encoding="utf-8") as handle:
+        text = handle.read()
+    path_to_input = {path: name for name, path in FLAKE_INPUT_RE.findall(text)}
+    inputs = []
+    for change in changes:
+        name = path_to_input.get(change["path"].lstrip("./"))
+        if name and name not in inputs:
+            inputs.append(name)
+    for name in inputs:
+        try:
+            proc = subprocess.run(
+                ["nix", "--extra-experimental-features",
+                 "nix-command flakes", "flake", "lock", "--update-input", name],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            print(f"warning: nix unavailable; input {name} not re-locked", file=sys.stderr)
+            continue
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"nix flake lock --update-input {name} failed: {proc.stderr.strip()}"
+            )
+        git(["add", "flake.lock"], cwd=root)
+
+
+def gather_ci_checks(root, branch):
+    """Best-effort CI status via gh (GitHub). Anything else needs
+    --checks-file; gate never invents statuses."""
+    sha = git(["rev-parse", branch], cwd=root).stdout.strip()
+    remote = git(["remote", "get-url", "origin"], cwd=root, check=False).stdout.strip()
+    match = re.match(r"(?:https://[^/]+/|git@[^:]+:)([^/]+)/([^/]+?)(?:\.git)?$", remote or "")
+    if not match:
+        raise RuntimeError(
+            "cannot derive owner/repo from origin remote; use --checks-file"
+        )
+    owner, repo = match.group(1), match.group(2)
+    proc = subprocess.run(
+        ["gh", "api", f"repos/{owner}/{repo}/commits/{sha}/check-runs"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gh check-runs lookup failed: {proc.stderr.strip()}; use --checks-file"
+        )
+    mapping = {}
+    for run in json.loads(proc.stdout or "{}").get("check_runs", []):
+        conclusion = run.get("conclusion")
+        if run.get("status") != "completed":
+            mapping[run.get("name", "check")] = "pending"
+        elif conclusion == "success":
+            mapping[run.get("name", "check")] = "green"
+        elif conclusion in ("skipped", "neutral"):
+            mapping[run.get("name", "check")] = "skipped"
+        else:
+            mapping[run.get("name", "check")] = "red"
+    if not mapping:
+        raise RuntimeError("no check runs reported; use --checks-file")
+    return mapping
+
+
+def cmd_gate(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    if git(["rev-parse", "--verify", args.branch], cwd=root, check=False).returncode != 0:
+        return fail(f"unknown branch {args.branch}")
+    if args.proposal:
+        proposal_path = args.proposal
+    else:
+        proposal_path = os.path.join(
+            root, "proposals", f"{args.branch.split('/')[-1]}.json"
+        )
+    try:
+        with open(proposal_path, encoding="utf-8") as handle:
+            proposal = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return fail(f"cannot read proposal {proposal_path}: {exc}")
+    changes = proposal.get("changes", [])
+    if not changes:
+        return fail("proposal carries no changes")
+
+    if args.checks_file:
+        try:
+            with open(args.checks_file, encoding="utf-8") as handle:
+                checks = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            return fail(f"cannot read checks file {args.checks_file}: {exc}")
+        if not isinstance(checks, dict) or not checks:
+            return fail("checks file must be a non-empty {check: status} object")
+    else:
+        try:
+            checks = gather_ci_checks(root, args.branch)
+        except RuntimeError as exc:
+            return fail(str(exc))
+
+    try:
+        policy.write_checks_facts(checks, os.path.join(root, "facts", "checks.pl"))
+    except ValueError as exc:
+        return fail(str(exc))
+
+    changeset = policy.build_changeset(changes)
+    rc, _ = policy.run_swipl(["merge_allowed", changeset], cwd=root)
+    if rc == 0:
+        emit({"policy": "merge_allowed", "branch": args.branch, "checks": checks})
+        return 0
+    if rc == 1:
+        _, out = policy.run_swipl(["merge_denial", changeset], cwd=root)
+        emit(
+            {
+                "policy": "denied",
+                "branch": args.branch,
+                "denials": policy.parse_denials(out) or ["merge denied"],
+            }
+        )
+        return 1
+    return fail("control plane raised a policy error while evaluating merge")
+
+
+def cmd_promote(args):
+    root = policy.find_repo_root(args.repo or os.getcwd())
+    if args.from_stage not in STAGES or args.to_stage not in STAGES:
+        return fail(f"stages must be one of {', '.join(STAGES)}")
+    rc, _ = policy.run_swipl(
+        ["deployment_allowed", args.from_stage, args.to_stage], cwd=root
+    )
+    if rc != 0:
+        emit(
+            {
+                "policy": "denied",
+                "from": args.from_stage,
+                "to": args.to_stage,
+                "denials": [f"deployment_allowed({args.from_stage}, {args.to_stage})"],
+            }
+        )
+        return 1
+    if args.to_stage == "staging":
+        rc, _ = policy.run_swipl(["staging_allowed", args.revision], cwd=root)
+        if rc != 0:
+            emit(
+                {
+                    "policy": "denied",
+                    "from": args.from_stage,
+                    "to": args.to_stage,
+                    "denials": [f"staging_allowed({args.revision})"],
+                }
+            )
+            return 1
+    if args.to_stage == "release":
+        rc, _ = policy.run_swipl(["release_allowed"], cwd=root)
+        if rc != 0:
+            emit(
+                {
+                    "policy": "denied",
+                    "from": args.from_stage,
+                    "to": args.to_stage,
+                    "denials": ["release_allowed(universe)"],
+                }
+            )
+            return 1
+    emit(
+        {
+            "policy": "allowed",
+            "from": args.from_stage,
+            "to": args.to_stage,
+            "revision": args.revision,
+        }
+    )
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="universe-manager",
+        description="Deterministic universe control-plane actor (no LLM).",
+    )
+    parser.add_argument(
+        "--repo",
+        help="operate inside this repository (default: nearest git root)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    inspect_p = sub.add_parser(
+        "inspect", help="components with pins and upstream heads"
+    )
+    inspect_p.set_defaults(func=cmd_inspect)
+    discover_p = sub.add_parser(
+        "discover", help="stale components as candidate changes"
+    )
+    discover_p.set_defaults(func=cmd_discover)
+
+    facts = sub.add_parser(
+        "facts", help="(re)generate machine facts (pins/heads/notes)"
+    )
+    facts.set_defaults(func=cmd_facts)
+
+    propose = sub.add_parser("propose", help="build an admissible changeset proposal")
+    propose.add_argument("--components", help="comma-separated component atoms")
+    propose.add_argument("--all", action="store_true", help="every stale component")
+    propose.set_defaults(func=cmd_propose)
+
+    apply_p = sub.add_parser("apply", help="apply a proposal on a new branch")
+    apply_p.add_argument("proposal", help="proposal JSON path")
+    apply_p.set_defaults(func=cmd_apply)
+
+    gate = sub.add_parser("gate", help="evaluate the merge gate for a branch")
+    gate.add_argument("branch")
+    gate.add_argument(
+        "--checks-file",
+        help="JSON {check: status} mapping (green|red|skipped|pending)",
+    )
+    gate.add_argument("--proposal", help="proposal JSON (default: proposals/<branch>.json)")
+    gate.set_defaults(func=cmd_gate)
+
+    promote = sub.add_parser("promote", help="evaluate a deployment stage transition")
+    promote.add_argument("from_stage")
+    promote.add_argument("to_stage")
+    promote.add_argument("revision")
+    promote.set_defaults(func=cmd_promote)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except RuntimeError as exc:
+        return fail(str(exc))
+    except Exception as exc:  # unexpected: still JSON + exit 2
+        return fail(f"unexpected failure: {exc!r}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

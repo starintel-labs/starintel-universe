@@ -42,24 +42,41 @@ consult_from_here(File) :-
     directory_file_path(Dir, File, Path),
     consult(Path).
 
-% facts_dir/1 resolves the machine-generated fact directory. Override with
-% the STARINTEL_UNIVERSE_FACTS environment variable.
+% facts_dir/1 resolves the machine-generated fact directory: the
+% STARINTEL_UNIVERSE_FACTS environment variable wins; otherwise the
+% repository root (parent of this control-plane directory), never the
+% process cwd (which cli.pl may have moved).
 facts_dir(Dir) :-
-    getenv('STARINTEL_UNIVERSE_FACTS', Env), Env \= '', !,
+    getenv('STARINTEL_UNIVERSE_FACTS', Env),
+    Env \= '',
+    !,
     Dir = Env.
-facts_dir('facts').
+facts_dir(Dir) :-
+    prolog_load_context(directory, CtrlDir),
+    parent_directory(CtrlDir, Root),
+    directory_file_path(Root, 'facts', Dir).
+
+parent_directory(Dir, Parent) :-
+    atom_concat(Parent, '/', Dir),
+    !.
+parent_directory(Dir, Parent) :-
+    prolog_to_os_filename(Old, Dir),
+    atom_concat(Parent0, '/', Old),
+    prolog_to_os_filename(Parent0, Parent).
 
 load_facts :-
     facts_dir(Dir),
     exists_directory(Dir),
     !,
     directory_files(Dir, Entries),
-    member(File, Entries),
-    file_name_extension(_, pl, File),
-    directory_file_path(Dir, File, Path),
-    exists_file(Path),
-    consult(Path),
-    fail.
+    forall(
+        ( member(File, Entries),
+          file_name_extension(Base, pl, File),
+          Base \== '',
+          \+ member(File, ['.', ..]) ),
+        ( directory_file_path(Dir, File, Path),
+          exists_file(Path),
+          consult(Path) )).
 load_facts.
 
 % must/1: policy helper — throws a typed policy_violation instead of

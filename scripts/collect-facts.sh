@@ -42,7 +42,7 @@ git submodule status | while read -r _sha _path _rest; do
   branch="$(git -C "$_path" branch --contains "$sha" 2>/dev/null | grep -E 'main|master' | head -1 | tr -d ' *' || true)"
   [ -z "$branch" ] && branch=detached
   for comp in $(component_atom "$name" 2>/dev/null || true); do
-    printf 'pin(%s, %s, %s).\n' "$comp" "$sha" "$branch" >> "$FACTS_DIR/pins.pl"
+    printf "pin(%s, '%s', %s).\n" "$comp" "$sha" "$branch" >> "$FACTS_DIR/pins.pl"
   done
 done
 
@@ -62,9 +62,9 @@ for spec in \
   set -- $spec
   comp="$1"; repo="$2"; branch="$3"
   head="$(git ls-remote "https://git.starintel.actor/nsaspy/${repo}.git" "refs/heads/${branch}" 2>/dev/null | cut -f1 || true)"
-  [ -n "$head" ] && printf 'upstream_head(%s, %s).\n' "$comp" "$head" >> "$FACTS_DIR/heads.pl"
+  [ -n "$head" ] && printf "upstream_head(%s, '%s').\n" "$comp" "$head" >> "$FACTS_DIR/heads.pl"
 done
 
-printf 'revision_note(universe, note(sha(%s))).\n' "$(git rev-parse HEAD)" >> "$FACTS_DIR/notes.pl"
+printf "revision_note(universe, note(sha('%s'))).\n" "$(git rev-parse HEAD)" >> "$FACTS_DIR/notes.pl"
 
 echo "facts written to $FACTS_DIR" >&2

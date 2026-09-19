@@ -1,0 +1,158 @@
+#+TITLE: StarIntel Universe — distro packaging
+#+AUTHOR: StarIntel
+#+OPTIONS: toc:2
+
+This directory builds *VANTA* and *starintel* packages for deb, rpm and arch
+from the same pinned submodule revisions the nix flake uses.
+
+* Packages
+
+| package    | payload                                                                                              |
+|------------+------------------------------------------------------------------------------------------------------|
+| =vanta=    | =/opt/vanta= — the pinned =components/zara= python source + =vanta*= wrappers, desktop files, icon, default config, hardened opt-in systemd units |
+| =starintel= | =/opt/starintel= — =components/star-kb= tooling (=star-kb-validate=, ...) + universe scripts, inert =starintel-server.service= |
+
+Both packages: =Depends:= =python3= only, no conffiles, no service is ever
+enabled or started by install scripts (privacy: no autostart). =%post=
+(disk) runs =systemctl daemon-reload= and =update-desktop-database= only.
+
+* Payload model — python source, not the nix closure
+
+The nix-built vanta package cannot ship in a distro package: its =bin/=
+shims =exec= interpreters under =/nix/store=. Distro packages therefore
+pip-install the *pinned zara python source*:
+
+: python3 -m pip install --no-index --no-deps --no-build-isolation \
+:   --target <staging>/opt/vanta/lib/python components/zara
+
+and generate =vanta*= wrappers in =/opt/vanta/bin= that mirror
+=distro/vanta/package.nix= (XDG bootstrap + zarathushtra→vanta bridge) and
+=exec= the *system* =python3= against =PYTHONPATH=/opt/vanta/lib/python=.
+This runs on any python3 ≥ 3.11 (verified on 3.12 ubuntu, 3.13 fedora,
+3.14 arch).
+
+** What works on a stock python3 (no PyPI deps)
+
+- =python3 -c 'import zara'= against the packaged source — the package
+  =__init__= is stdlib-only.
+- =vanta --help= — exits 0 even when zara's optional heavy deps
+  (=numpy=, =httpx=, =soundfile=, ...) are missing: the wrapper detects the
+  failed entrypoint import and answers =--help= itself (documented
+  degradation, =VANTA_NO_PROVIDER=1= is exported by every wrapper).
+- Full agent functionality needs the optional deps:
+  : python3 -m pip install -r /opt/vanta/share/vanta/requirements.txt
+  (generated from the wheel =METADATA= at build time; nothing downloads at
+  build time — =--no-index= keeps pip off the network).
+
+** Where the staging inputs come from
+
+- =components/zara= (pinned submodule) — python payload, always.
+- =distro/vanta= — desktop entries (with =@BIN@= → =/opt/vanta/bin=),
+  branding icon, default config. Desktop entries always come from the
+  sources because the nix build tree's copies have =@BIN@= already
+  substituted with =/nix/store= paths.
+- =/tmp/opencode/vanta-build= (=$VANTA_BUILD_DIR=) — the nix-built share
+  tree; when present its config/icon are preferred. When absent the build
+  proceeds from =distro/vanta= sources with a warning. If the actual python
+  payload source is missing the build *fails* — placeholder =lib/vanta=
+  trees are never produced.
+- =components/star-kb= — tooling; =scripts/*.sh= from the universe root.
+- =components/star-lang= — a =starlang= wrapper is staged only when a
+  star-lang build exists at =$VANTA_STARLANG_BUILD=
+  (default =/tmp/opencode/starlang-build=); never a placeholder.
+
+* Inputs
+
+The packages build from exactly the pinned submodule revisions the flake
+locks. Quote of =git submodule status= at build time (recorded verbatim in
+=dist/packaging-manifest.json= along with each artifact's sha256):
+
+#+begin_src sh :exports both :results output
+cd "$(git rev-parse --show-toplevel)" && git submodule status
+#+end_src
+
+#+RESULTS:
+:  5f63824827984bd32f754f7a5a5f9774b6c1745b components/dotfiles (logos-2026.07.19-727-g5f63824)
+:  51d2530f0e18c84cff860b7c0bf3afcc3c488057 components/prolog-rlm (heads/main)
+:  505835ceb77ebfbea070e72cbcc2001f32a952eb components/quasar (heads/main)
+:  28684ae94953bfec199ed103172526f10a767d32 components/quasar-ui (heads/main)
+:  b8dfbe2f9f56065ace8c3313b92ca748a115cdfa components/star-cl (0.8.03-49-gb8dfbe2)
+:  14bfe0668e2b67ab64e206f469c2f75d139640c1 components/star-kb (heads/main)
+:  7db89986450d4e513ff4b5c9617bf4d196b3cfb4 components/star-lang (heads/main)
+:  4721efaf8141fd7199b6e1ceb1011b9ad970796e components/starintel-server (heads/master)
+:  812d202c0b061a05a081ae8c94f5b02a349954ad components/zara (device-acceptance-661-50-g812d202c)
+:  89f0e938fbd57a13c58e597b2ef65c0d59b67810 components/zara-plugins (heads/main)
+
+* Build commands
+
+All builders write to =dist/= and stamp artifacts with
+=SOURCE_DATE_EPOCH= (HEAD commit time; mtimes clamped) for determinism.
+
+#+begin_src sh
+# deb (host dpkg-deb, or docker debian:bookworm-slim when absent)
+bash packaging/deb/build-deb.sh
+#   -> dist/vanta_<version>_amd64.deb  dist/starintel_<version>_amd64.deb
+
+# rpm (host rpmbuild when present, else fail-with-instructions;
+#      RPM_DOCKER=1 runs rpmbuild inside fedora:41)
+bash packaging/rpm/build-rpm.sh
+#   -> dist/vanta-<version>-1.x86_64.rpm  dist/starintel-<version>-1.x86_64.rpm
+
+# arch (always docker archlinux:base; makepkg as unprivileged build user)
+bash packaging/arch/build-arch.sh
+#   -> dist/vanta-<version>-1-x86_64.pkg.tar.zst  dist/starintel-<version>-1-x86_64.pkg.tar.zst
+#+end_src
+
+=packaging/common.sh= is the single source of staging truth:
+=release_version()= reads =manifest.json= when present (normalised to
+=<major.minor>=) else falls back to =0.YYYYMMDD=; =collect_staging()=
+builds the shared tree; =copy_package_subset= carves the identical
+per-package file set for all three formats; =write_manifest()= records
+component SHAs + artifact sha256s into =dist/packaging-manifest.json=.
+
+* Install tests
+
+#+begin_src sh
+bash tests/packaging/install-test.sh deb   # ubuntu:24.04
+bash tests/packaging/install-test.sh rpm   # fedora:41
+bash tests/packaging/install-test.sh arch  # archlinux:base
+#+end_src
+
+Each run installs both packages in docker, then checks (PASS/FAIL, nonzero
+exit on failure): binaries exist, desktop files (validated with
+=desktop-file-validate= where available), units pass
+=systemd-analyze verify= where available (=starintel-server.service=
+tolerates only the documented missing-binary note — the SBCL server binary
+is packaged separately from nix and the unit ships inert), =vanta --help=
+exits 0 offline, =import zara= against the packaged source,
+=star-kb-validate= against a minimal valid roam tree, nothing was
+auto-enabled, XDG behaviour (no =$HOME= dotdirs, zarathushtra→vanta bridge
+inside XDG trees), and a clean uninstall leaving no =/opt/vanta=.
+
+* XDG bridge
+
+The packages create no =$HOME= dot-directories — ever. All per-user state
+lives under =$XDG_{CONFIG,DATA,STATE,CACHE}_HOME/vanta= and upstream zara's
+=zarathushtra= name is bridged by a symlink *inside* each XDG tree
+(=$XDG_CONFIG_HOME/zarathushtra -> vanta=), mirroring
+=distro/vanta/package.nix=. Full details:
+=/usr/share/doc/vanta/README.XDG.md= (shipped in every package).
+
+* Licensing
+
+Upstream zara ships =GPL-3.0= as its =LICENSE= (the setup.py classifier
+still says MIT — an upstream inconsistency; noted in the shipped =copyright=
+file). The StarIntel packaging layer (wrappers, units, desktop files,
+branding) is MIT. =vanta= therefore declares =GPL-3.0-only AND MIT=.
+
+* Knobs
+
+| variable              | default                   | effect                                   |
+|-----------------------+---------------------------+------------------------------------------|
+| =VANTA_BUILD_DIR=     | =/tmp/opencode/vanta-build= | nix-built share tree to prefer         |
+| =VANTA_PYTHON_IMAGE=  | =python:3.11-slim=        | image used to pip-stage zara when host python lacks pip |
+| =DEB_DOCKER_IMAGE=    | =debian:bookworm-slim=    | image used for dpkg-deb fallback         |
+| =RPM_DOCKER= / =RPM_DOCKER_IMAGE= | =0= / =fedora:41= | run rpmbuild inside docker when host rpmbuild is absent |
+| =ARCH_DOCKER_IMAGE=   | =archlinux:base=          | image used for makepkg                   |
+| =ARCH_NODEPS=         | =0=                       | pass =--nodeps= to makepkg               |
+| =VANTA_STARLANG_BUILD= | =/tmp/opencode/starlang-build= | star-lang build dir for the optional =starlang= wrapper |

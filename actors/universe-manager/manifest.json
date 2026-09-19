@@ -1,0 +1,16 @@
+{
+  "name": "universe-manager",
+  "version": "1.0.0",
+  "kind": "deterministic-actor",
+  "llm": false,
+  "entrypoint": "bin/universe-manager",
+  "capabilities": [
+    "component.inspect",
+    "update.propose",
+    "policy.query",
+    "ci.trigger",
+    "merge.evaluate",
+    "deploy.promote"
+  ],
+  "provider": "none"
+}

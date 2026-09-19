@@ -85,7 +85,8 @@ decide(Goal) :-
     (   catch(Goal, E, true)
     ->  (   var(E)
         ->  halt(0)
-        ;   print_message(error, E),
+        ;   message_to_string(E, Msg),
+            format(user_error, "POLICY-ERROR: ~s~n", [Msg]),
             halt(2)
         )
     ;   halt(1)
