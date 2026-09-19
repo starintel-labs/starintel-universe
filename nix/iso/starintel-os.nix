@@ -55,7 +55,7 @@ with lib;
     };
 
     isoImage = {
-      isoBaseName = mkDefault "StarIntel-OS";
+      isoBaseName = mkForce "StarIntel-OS";
       makeEfiBootable = mkDefault true;
       makeBiosBootable = mkDefault true;
       squashfsCompression = mkDefault "zstd -Xcompression-level 19";

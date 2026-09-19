@@ -12,11 +12,16 @@ buildNpmPackage rec {
 
   inherit src;
 
-  npmDepsHash = ""; # computed on first build; see update instructions
+  npmDepsHash = "sha256-OZvAblVkNZcsafsSYWn9APZt5Y89YXkNbeK9XNHtJFU=";
 
   nodejs = nodejs_22;
 
   npmBuildScript = "build";
+  # quasar-ui's package-lock pins a github: dependency (starintel_doc);
+  # its transitive tarballs are not part of the offline npm cache, so the
+  # fetch falls back to git (still lockfile-pinned, not floating).
+  forceGitDeps = true;
+  makeCacheWritable = true;
 
   installPhase = ''
     runHook preInstall
