@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VANTA Console
+GenericName=StarIntel Assistant Console
+Comment=VANTA terminal session (no provider required)
+Exec=@BIN@/vanta
+Icon=vanta
+Terminal=true
+Categories=Utility;System;ConsoleOnly;
+Keywords=assistant;agent;starintel;

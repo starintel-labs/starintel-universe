@@ -34,6 +34,12 @@ registry_paths(Paths) :-
 path_share_count(P, C) :-
     aggregate_all(count, component(_, P, _), C).
 
+% True when the suite runs inside a full recursive checkout (submodules
+% present). The Nix sandbox check copies only the universe tree, where
+% submodule directories legitimately do not exist.
+in_full_worktree :-
+    exists_file('components/zara/.git').
+
 :- begin_tests(structure).
 
 test(gitmodules_matches_registry) :-
@@ -48,7 +54,7 @@ test(vanta_is_zara_identity) :-
     component(vanta, Path, agent),
     component(zara, Path, agent).
 
-test(component_paths_exist) :-
+test(component_paths_exist, [condition(in_full_worktree)]) :-
     forall(component(_, Path, _), exists_directory(Path)).
 
 test(no_unexpected_duplicate_component_paths) :-

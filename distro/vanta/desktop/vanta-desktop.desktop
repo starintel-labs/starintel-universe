@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=VANTA
+GenericName=StarIntel Assistant
+Comment=VANTA — the StarIntel agent (desktop interface)
+Exec=@BIN@/vanta-desktop
+Icon=vanta
+Terminal=false
+Categories=Utility;System;Office;
+StartupNotify=true
+NoDisplay=false

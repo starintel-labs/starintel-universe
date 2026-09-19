@@ -1,0 +1,29 @@
+# VANTA — generic distribution defaults.
+#
+# Offline-first: the default LLM provider is local ollama; the system is
+# fully usable without any provider credential. Wake listening is opt-in.
+# Personal overrides belong in $XDG_CONFIG_HOME/vanta/config.local.toml
+# (never shipped).
+
+[desktop]
+enabled = true
+
+[daemon]
+host = "127.0.0.1"
+
+[stt]
+provider = "local"
+
+[tts]
+provider = "local"
+
+[llm]
+provider = "ollama"
+
+[wake]
+enabled = false
+
+[plugins]
+# The StarIntel Server plugin ships in zara-plugins; enabled by default
+# so VANTA can reach a local StarIntel Server without manual setup.
+zara-starintel-server = { enabled = true }
